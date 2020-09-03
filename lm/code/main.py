@@ -80,6 +80,13 @@ parser.add_argument('--max_seq_len_delta', type=int, default=40,
                     help='max sequence length')
 parser.add_argument('--single_gpu', default=False, action='store_true', 
                     help='use single GPU')
+
+# LM robustness
+parser.add_argument('--ndistilstudents', type=int, default=0,
+                    help='number state  distillation students per layer')
+parser.add_argument('--distillossw', type=float, default=1.0,
+                    help='student distillation loss weight')
+
 args = parser.parse_args()
 
 if args.nhidlast < 0:
@@ -131,7 +138,7 @@ if args.continue_train:
 else:
     model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nhidlast, args.nlayers, 
                        args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, 
-                       args.tied, args.dropoutl, args.n_experts)
+                       args.tied, args.dropoutl, args.n_experts, args.ndistilstudents)
 
 if args.cuda:
     if args.single_gpu:
@@ -162,7 +169,7 @@ def evaluate(data_source, batch_size=10):
             data, targets = get_batch(data_source, i, args)
             targets = targets.view(-1)
 
-            log_prob, hidden = parallel_model(data, hidden)
+            log_prob, hidden = parallel_model(data, hidden, average_ensemble=True)
             loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), targets).data
 
             total_loss += loss * len(data)
@@ -202,7 +209,7 @@ def train():
             # If we didn't, the model would try backpropagating all the way to start of the dataset.
             hidden[s_id] = repackage_hidden(hidden[s_id])
 
-            log_prob, hidden[s_id], rnn_hs, dropped_rnn_hs = parallel_model(cur_data, hidden[s_id], return_h=True)
+            log_prob, hidden[s_id], rnn_hs, dropped_rnn_hs, student_distill_loss = parallel_model(cur_data, hidden[s_id], return_h=True, return_student_distill_loss=True)
             raw_loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), cur_targets)
 
             loss = raw_loss
@@ -210,6 +217,8 @@ def train():
             loss = loss + sum(args.alpha * dropped_rnn_h.pow(2).mean() for dropped_rnn_h in dropped_rnn_hs[-1:])
             # Temporal Activation Regularization (slowness)
             loss = loss + sum(args.beta * (rnn_h[1:] - rnn_h[:-1]).pow(2).mean() for rnn_h in rnn_hs[-1:])
+            # Student distillation loss
+            loss = loss + args.distillossw * student_distill_loss
             loss *= args.small_batch_size / args.batch_size
             total_loss += raw_loss.data * args.small_batch_size / args.batch_size
             loss.backward()
@@ -305,7 +314,8 @@ except KeyboardInterrupt:
 
 # Load the best saved model.
 model = torch.load(os.path.join(args.save, 'model.pt'))
-parallel_model = nn.DataParallel(model, dim=1).cuda()
+#parallel_model = nn.DataParallel(model, dim=1).cuda()
+parallel_model = model.cuda()
 
 # Run on test data.
 test_loss = evaluate(test_data, test_batch_size)

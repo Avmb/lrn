@@ -188,7 +188,7 @@ def get_cell(cell_type):
 class RNN(nn.Module):
 
     def __init__(self, cell_type, input_size, hidden_size,
-                 num_layers=1, batch_first=False, dropout=0, **kwargs):
+                 num_layers=1, batch_first=False, dropout=0, n_students=0, **kwargs):
         super(RNN, self).__init__()
         self.cell_type = cell_type
         self.input_size = input_size
@@ -196,12 +196,17 @@ class RNN(nn.Module):
         self.num_layers = num_layers
         self.batch_first = batch_first
         self.dropout = dropout
+        self.n_students = n_students
         self.c_on = self.cell_type == "lstm" or self.cell_type == "sru"
 
         for layer in range(num_layers):
             layer_input_size = input_size if layer == 0 else hidden_size
-            cell = get_cell(cell_type)(
-                input_size=layer_input_size, hidden_size=hidden_size, **kwargs)
+            cell_type = get_cell(cell_type)
+            if n_students > 0:
+                cell = StudentDistillCell(input_size=layer_input_size, hidden_size=hidden_size, cell_type=cell_type,
+                                          n_students=n_students, c_on=self.c_on, **kwargs) 
+            else:
+                cell = cell_type(input_size=layer_input_size, hidden_size=hidden_size, **kwargs)
             setattr(self, 'cell_{}'.format(layer), cell)
         self.dropout_layer = nn.Dropout(dropout)
         self.reset_parameters()
@@ -214,14 +219,14 @@ class RNN(nn.Module):
             cell = self.get_cell(layer)
             cell.reset_parameters()
 
-    def _forward_rnn(self, cell, x, h, L):
+    def _forward_rnn(self, cell, x, h, L, **kwargs):
         max_time = x.size(0)
         output = []
         for time in range(max_time):
             if self.c_on:
-                new_h, new_c = cell(x[time], h)
+                new_h, new_c = cell(x[time], h, **kwargs)
             else:
-                new_h = cell(x[time], h)
+                new_h = cell(x[time], h, **kwargs)
 
             mask = (time < L).float().unsqueeze(1).expand_as(new_h)
             new_h = new_h*mask + h[0]*(1 - mask)
@@ -237,7 +242,7 @@ class RNN(nn.Module):
         output = torch.stack(output, 0)
         return output, h
 
-    def forward(self, x, h=None, L=None):
+    def forward(self, x, h=None, L=None, **kwargs):
         if self.batch_first:
             x = x.transpose(0, 1)
         max_time, batch_size, _ = x.size()
@@ -263,10 +268,10 @@ class RNN(nn.Module):
             
             if layer == 0:
                 layer_output, layer_state = self._forward_rnn(
-                    cell, x, h_layer, L)
+                    cell, x, h_layer, L, **kwargs)
             else:
                 layer_output, layer_state = self._forward_rnn(
-                    cell, layer_output, h_layer, L)
+                    cell, layer_output, h_layer, L, **kwargs)
 
             if layer != self.num_layers - 1:
                 layer_output = self.dropout_layer(layer_output)
@@ -279,3 +284,51 @@ class RNN(nn.Module):
             return output, (torch.stack(states[0], 0), torch.stack(states[1], 0))
         else:
             return output, torch.stack(states, 0)
+
+# LM robustness
+class StudentDistillCell(nn.Module):
+    def __init__(self, input_size, hidden_size, cell_type, n_students=0, c_on=False):
+
+        super(StudentDistillCell, self).__init__()
+        self.input_size = input_size
+        self.hidden_size = hidden_size
+        self.cell_type = cell_type
+        self.n_students = n_students
+        self.c_on = c_on
+        
+        self.main_cell = cell_type(input_size, hidden_size)
+        self.student_cells = torch.nn.ModuleList([cell_type(input_size, hidden_size) for i in range(n_students)])
+        self.distill_loss = torch.nn.MSELoss(reduction='mean')
+
+    def reset_parameters(self):
+        self.main_cell.reset_parameters()
+        for i in range(self.n_students):
+            self.student_cells[i].reset_parameters()
+
+    def forward(self, x, h_, average_ensemble=False, distill_loss_acc=None):
+        h = self.main_cell(x, h_)
+        x_nograd, h__nograd = x.detach(), h_.detach()
+        student_h_list = [student_cell(x_nograd, h__nograd) for student_cell in self.student_cells]
+        if distill_loss_acc != None:
+            for student_h in student_h_list:
+                if self.c_on:
+                    student_distill_loss = self.distill_loss(student_h[0], h[0].detach())
+                    distill_loss_acc[0] += student_distill_loss
+                    student_distill_loss = self.distill_loss(student_h[1], h[1].detach())
+                    distill_loss_acc[0] += student_distill_loss
+                else:
+                    student_distill_loss = self.distill_loss(student_h, h.detach())
+                    distill_loss_acc[0] += student_distill_loss
+        if average_ensemble:
+            all_h_list = student_h_list + [h]
+            if self.c_on:
+                all_hh_list = [h[0] for h in all_h_list]
+                all_hc_list = [h[1] for h in all_h_list]
+                hh = torch.stack(all_hh_list).mean(dim=0)
+                hc = torch.stack(all_hc_list).mean(dim=0)
+                h = (hh, hc)
+            else:
+                h = torch.stack(all_h_list).mean(dim=0)
+        return h
+
+

@@ -15,17 +15,19 @@ class RNNModel(nn.Module):
 
     def __init__(self, rnn_type, ntoken, ninp, nhid, nhidlast, nlayers, 
                  dropout=0.5, dropouth=0.5, dropouti=0.5, dropoute=0.1, wdrop=0, 
-                 tie_weights=False, ldropout=0.5, n_experts=10):
+                 tie_weights=False, ldropout=0.5, n_experts=10, ndistilstudents=0):
         super(RNNModel, self).__init__()
+        self.ndistilstudents=ndistilstudents
         self.use_dropout = True
         self.lockdrop = LockedDropout()
         self.encoder = nn.Embedding(ntoken, ninp)
         
-        self.rnns = [rnn.RNN(rnn_type, ninp if l == 0 else nhid, nhid if l != nlayers - 1 else nhidlast, 1, dropout=0) for l in range(nlayers)]
+        rnn_type = rnn_type.lower()
+        self.rnns = [rnn.RNN(rnn_type, ninp if l == 0 else nhid, nhid if l != nlayers - 1 else nhidlast, 1, dropout=0, n_students=ndistilstudents) for l in range(nlayers)]
         if wdrop:
             self.rnns = [WeightDrop(rnn, ['_W', '_U'], dropout=wdrop if self.use_dropout else 0) for rnn in self.rnns]
         self.rnns = torch.nn.ModuleList(self.rnns)
-
+        
         self.prior = nn.Linear(nhidlast, n_experts, bias=False)
         self.latent = nn.Sequential(nn.Linear(nhidlast, n_experts*ninp), nn.Tanh())
         self.decoder = nn.Linear(ninp, ntoken)
@@ -68,7 +70,7 @@ class RNNModel(nn.Module):
         self.decoder.bias.data.fill_(0)
         self.decoder.weight.data.uniform_(-initrange, initrange)
 
-    def forward(self, input, hidden, return_h=False, return_prob=False):
+    def forward(self, input, hidden, return_h=False, return_prob=False, return_student_distill_loss=False, average_ensemble=False):
         batch_size = input.size(1)
 
         emb = embedded_dropout(self.encoder, input, dropout=self.dropoute if (self.training and self.use_dropout) else 0)
@@ -81,9 +83,13 @@ class RNNModel(nn.Module):
         #raw_output, hidden = self.rnn(emb, hidden)
         raw_outputs = []
         outputs = []
+        distill_loss_acc = [torch.tensor(0.0).to(input.device)] if return_student_distill_loss else None
         for l, rnn in enumerate(self.rnns):
             current_input = raw_output
-            raw_output, new_h = rnn(raw_output, hidden[l])
+            if self.ndistilstudents  == 0:
+                raw_output, new_h = rnn(raw_output, hidden[l])
+            else:
+                raw_output, new_h = rnn(raw_output, hidden[l], distill_loss_acc=distill_loss_acc, average_ensemble=average_ensemble)
             new_hidden.append(new_h)
             raw_outputs.append(raw_output)
             if l != self.nlayers - 1:
@@ -113,11 +119,15 @@ class RNNModel(nn.Module):
 
         model_output = model_output.view(-1, batch_size, self.ntoken)
 
+        rv = (model_output, hidden)
         if return_h:
-            return model_output, hidden, raw_outputs, outputs
-        return model_output, hidden
+            rv = rv + (raw_outputs, outputs)
+        if return_student_distill_loss:
+            rv = rv + (distill_loss_acc[0], )
+        return rv
 
     def init_hidden(self, bsz):
+        #print(self.rnn_type)
         weight = next(self.parameters()).data
         if self.rnn_type == "lstm" or self.rnn_type == "sru":
             return [(Variable(weight.new(1, bsz, self.nhid if l != self.nlayers - 1 else self.nhidlast).zero_()),

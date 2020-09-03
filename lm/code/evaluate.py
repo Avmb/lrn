@@ -80,6 +80,15 @@ parser.add_argument('--max_seq_len_delta', type=int, default=40,
                     help='max sequence length')
 parser.add_argument('--single_gpu', default=False, action='store_true', 
                     help='use single GPU')
+
+# LM robustness
+parser.add_argument('--ndistilstudents', type=int, default=0,
+                    help='number state  distillation students per layer')
+parser.add_argument('--distillossw', type=float, default=1.0,
+                    help='student distillation loss weight')
+parser.add_argument('--no_average_ensemble', action='store_true',
+                    help='disable average ensemble, use only master')
+
 args = parser.parse_args()
 
 if args.nhidlast < 0:
@@ -118,7 +127,7 @@ test_data = batchify(corpus.test, test_batch_size, args)
 # Evaluating code
 ###############################################################################
 
-def evaluate(data_source, batch_size=10):
+def evaluate(data_source, batch_size=10, average_ensemble=True):
     # Turn on evaluation mode which disables dropout.
     model.eval()
     total_loss = 0
@@ -129,7 +138,9 @@ def evaluate(data_source, batch_size=10):
             data, targets = get_batch(data_source, i, args)
             targets = targets.view(-1)
 
-            log_prob, hidden = parallel_model(data, hidden)
+            #print(data.shape)
+            #print([h.shape for h in hidden])
+            log_prob, hidden = parallel_model(data, hidden, average_ensemble=average_ensemble)
             loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), targets).data
 
             total_loss += loss * len(data)
@@ -140,10 +151,11 @@ def evaluate(data_source, batch_size=10):
 
 # Load the best saved model.
 model = torch.load(os.path.join(args.save, 'model.pt'))
-parallel_model = nn.DataParallel(model, dim=1).cuda()
+parallel_model = nn.DataParallel(model.cuda(), dim=1)
+#parallel_model = model.cuda()
 
 # Run on test data.
-test_loss = evaluate(test_data, test_batch_size)
+test_loss = evaluate(test_data, test_batch_size, average_ensemble=not args.no_average_ensemble)
 logging('=' * 89)
 logging('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
     test_loss, math.exp(test_loss)))
