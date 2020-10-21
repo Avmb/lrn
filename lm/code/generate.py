@@ -9,6 +9,7 @@ import argparse
 
 import torch
 from torch.autograd import Variable
+import torch.nn as nn
 
 import data
 
@@ -50,6 +51,7 @@ model.eval()
 
 if args.cuda:
     model.cuda()
+    parallel_model = nn.DataParallel(model, dim=1)
 else:
     model.cpu()
 
@@ -62,7 +64,7 @@ if args.cuda:
 
 with open(args.outf, 'w') as outf:
     for i in range(args.words):
-        output, hidden = model(input, hidden, return_prob=True)
+        output, hidden = parallel_model(*hidden, input=input, return_prob=True)
         word_weights = output.squeeze().data.div(args.temperature).exp().cpu()
         word_idx = torch.multinomial(word_weights, 1)[0]
         input.data.fill_(word_idx)

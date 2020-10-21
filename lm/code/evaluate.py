@@ -120,7 +120,8 @@ if torch.cuda.is_available():
 
 corpus = data.Corpus(args.data)
 
-test_batch_size = 1
+#test_batch_size = 1
+test_batch_size = args.batch_size
 test_data = batchify(corpus.test, test_batch_size, args)
 
 ###############################################################################
@@ -140,7 +141,7 @@ def evaluate(data_source, batch_size=10, average_ensemble=True):
 
             #print(data.shape)
             #print([h.shape for h in hidden])
-            log_prob, hidden = parallel_model(data, hidden, average_ensemble=average_ensemble)
+            log_prob, hidden = parallel_model(*hidden, input=data, average_ensemble=average_ensemble)
             loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), targets).data
 
             total_loss += loss * len(data)
@@ -151,8 +152,8 @@ def evaluate(data_source, batch_size=10, average_ensemble=True):
 
 # Load the best saved model.
 model = torch.load(os.path.join(args.save, 'model.pt'))
-#parallel_model = nn.DataParallel(model.cuda(), dim=1)
-parallel_model = model.cuda()
+parallel_model = nn.DataParallel(model.cuda(), dim=1)
+#parallel_model = model.cuda()
 
 # Run on test data.
 test_loss = evaluate(test_data, test_batch_size, average_ensemble=not args.no_average_ensemble)

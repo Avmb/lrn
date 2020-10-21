@@ -70,9 +70,16 @@ class RNNModel(nn.Module):
         self.decoder.bias.data.fill_(0)
         self.decoder.weight.data.uniform_(-initrange, initrange)
 
-    def forward(self, input, hidden, return_h=False, return_prob=False, return_student_distill_loss=False, average_ensemble=False):
+    def forward(self, *hidden, input=None, return_h=False, return_prob=False, return_student_distill_loss=False, average_ensemble=False):
         batch_size = input.size(1)
 
+        if self.rnn_type == "lstm" or self.rnn_type == "sru":
+            # hidden state must be rearranged a (h, c) tuple
+            rearranged_hidden = []
+            for i in range(0, len(hidden), 2):
+                rearranged_hidden.append((hidden[i], hidden[i+1]))
+            hidden = rearranged_hidden
+        
         emb = embedded_dropout(self.encoder, input, dropout=self.dropoute if (self.training and self.use_dropout) else 0)
         #emb = self.idrop(emb)
 
@@ -87,9 +94,9 @@ class RNNModel(nn.Module):
         for l, rnn in enumerate(self.rnns):
             current_input = raw_output
             if self.ndistilstudents  == 0:
-                raw_output, new_h = rnn(raw_output, hidden[l])
+                raw_output, new_h = rnn(current_input, hidden[l])
             else:
-                raw_output, new_h = rnn(raw_output, hidden[l], distill_loss_acc=distill_loss_acc, average_ensemble=average_ensemble)
+                raw_output, new_h = rnn(current_input, hidden[l], distill_loss_acc=distill_loss_acc, average_ensemble=average_ensemble)
             new_hidden.append(new_h)
             raw_outputs.append(raw_output)
             if l != self.nlayers - 1:
@@ -130,9 +137,14 @@ class RNNModel(nn.Module):
         #print(self.rnn_type)
         weight = next(self.parameters()).data
         if self.rnn_type == "lstm" or self.rnn_type == "sru":
-            return [(Variable(weight.new(1, bsz, self.nhid if l != self.nlayers - 1 else self.nhidlast).zero_()),
-                     Variable(weight.new(1, bsz, self.nhid if l != self.nlayers - 1 else self.nhidlast).zero_()))
-                    for l in range(self.nlayers)]
+            #return [(Variable(weight.new(1, bsz, self.nhid if l != self.nlayers - 1 else self.nhidlast).zero_()),
+            #         Variable(weight.new(1, bsz, self.nhid if l != self.nlayers - 1 else self.nhidlast).zero_()))
+            #        for l in range(self.nlayers)]
+            h_acc = []
+            for l in range(self.nlayers):
+                h_acc.append(Variable(weight.new(1, bsz, self.nhid if l != self.nlayers - 1 else self.nhidlast).zero_()))
+                h_acc.append(Variable(weight.new(1, bsz, self.nhid if l != self.nlayers - 1 else self.nhidlast).zero_()))
+            return h_acc
         else:
             return [Variable(weight.new(1, bsz, self.nhid if l != self.nlayers - 1 else self.nhidlast).zero_())
                     for l in range(self.nlayers)]
@@ -142,7 +154,7 @@ if __name__ == '__main__':
     model = RNNModel('LSTM', 10, 12, 12, 12, 2)
     input = Variable(torch.LongTensor(13, 9).random_(0, 10))
     hidden = model.init_hidden(9)
-    model(input, hidden)
+    model(hidden, input=input)
 
     # input = Variable(torch.LongTensor(13, 9).random_(0, 10))
     # hidden = model.init_hidden(9)

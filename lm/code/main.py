@@ -314,8 +314,8 @@ except KeyboardInterrupt:
 
 # Load the best saved model.
 model = torch.load(os.path.join(args.save, 'model.pt'))
-#parallel_model = nn.DataParallel(model, dim=1).cuda()
-parallel_model = model.cuda()
+parallel_model = nn.DataParallel(model, dim=1).cuda()
+#parallel_model = model.cuda()
 
 # Run on test data.
 test_loss = evaluate(test_data, test_batch_size)
