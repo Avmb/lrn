@@ -156,7 +156,7 @@ def evaluate(data_source, batch_size=10):
             data, targets = get_batch(data_source, i, args)
             targets = targets.view(-1)
             
-            log_prob, hidden = parallel_model(hidden, input=data)
+            log_prob, hidden = parallel_model(*hidden, input=data)
             loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), targets).data
 
             total_loss += len(data) * loss
@@ -194,7 +194,7 @@ def train():
             # If we didn't, the model would try backpropagating all the way to start of the dataset.
             hidden[s_id] = repackage_hidden(hidden[s_id])
 
-            log_prob, hidden[s_id], rnn_hs, dropped_rnn_hs = parallel_model(hidden[s_id], input=cur_data, return_h=True)
+            log_prob, hidden[s_id], rnn_hs, dropped_rnn_hs = parallel_model(*hidden[s_id], input=cur_data, return_h=True)
             raw_loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), cur_targets)
 
             loss = raw_loss

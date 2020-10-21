@@ -70,7 +70,7 @@ class RNNModel(nn.Module):
         self.decoder.bias.data.fill_(0)
         self.decoder.weight.data.uniform_(-initrange, initrange)
 
-    def forward(self, *hidden, input=None, return_h=False, return_prob=False, return_student_distill_loss=False, average_ensemble=False):
+    def forward(self, *hidden, input=None, return_h=False, return_prob=False, return_student_distill_loss=False, average_ensemble=False, flatten_returned_lists=False):
         batch_size = input.size(1)
 
         if self.rnn_type == "lstm" or self.rnn_type == "sru":
@@ -130,7 +130,16 @@ class RNNModel(nn.Module):
         if return_h:
             rv = rv + (raw_outputs, outputs)
         if return_student_distill_loss:
-            rv = rv + (distill_loss_acc[0], )
+            rv = rv + (distill_loss_acc[0].reshape([1, 1]), )
+        if flatten_returned_lists:
+            new_rv = []
+            for e in rv:
+                if isinstance(e, list):
+                    for ee in e:
+                        new_rv.append(ee)
+                else:
+                    new_rv.append(e)
+            rv = new_rv
         return rv
 
     def init_hidden(self, bsz):

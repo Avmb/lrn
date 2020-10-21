@@ -122,8 +122,10 @@ if torch.cuda.is_available():
 
 corpus = data.Corpus(args.data)
 
-eval_batch_size = 10
-test_batch_size = 1
+#eval_batch_size = 10
+#test_batch_size = 1
+eval_batch_size=args.batch_size
+test_batch_size=args.batch_size
 train_data = batchify(corpus.train, args.batch_size, args)
 val_data = batchify(corpus.valid, eval_batch_size, args)
 test_data = batchify(corpus.test, test_batch_size, args)
@@ -169,7 +171,7 @@ def evaluate(data_source, batch_size=10):
             data, targets = get_batch(data_source, i, args)
             targets = targets.view(-1)
 
-            log_prob, hidden = parallel_model(hidden, input=data, average_ensemble=True)
+            log_prob, hidden = parallel_model(*hidden, input=data, average_ensemble=True)
             loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), targets).data
 
             total_loss += loss * len(data)
@@ -209,7 +211,12 @@ def train():
             # If we didn't, the model would try backpropagating all the way to start of the dataset.
             hidden[s_id] = repackage_hidden(hidden[s_id])
 
-            log_prob, hidden[s_id], rnn_hs, dropped_rnn_hs, student_distill_loss = parallel_model(hidden[s_id], input=cur_data, return_h=True, return_student_distill_loss=True)
+            parallel_rv = parallel_model(*hidden[s_id], input=cur_data, return_h=True, return_student_distill_loss=True, flatten_returned_lists=True)
+            # reassemble return values
+            log_prob, student_distill_loss = parallel_rv[0], parallel_rv[-1].sum()
+            parallel_rv = np.array(parallel_rv[1:-1]).reshape((3, -1)).tolist()
+            hidden[s_id], rnn_hs, dropped_rnn_hs = parallel_rv
+            
             raw_loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), cur_targets)
 
             loss = raw_loss
@@ -274,7 +281,7 @@ try:
                 tmp[prm] = prm.data.clone()
                 prm.data = optimizer.state[prm]['ax'].clone()
 
-            val_loss2 = evaluate(val_data)
+            val_loss2 = evaluate(val_data, eval_batch_size)
             logging('-' * 89)
             logging('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
                     'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
