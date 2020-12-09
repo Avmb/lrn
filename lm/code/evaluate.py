@@ -2,6 +2,7 @@ import argparse
 import os, sys
 import time
 import math
+import pickle
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,11 +14,11 @@ import gc
 import data
 import model
 
-from utils import batchify, get_batch, repackage_hidden, create_exp_dir, save_checkpoint
+from utils import batchify, get_batch, eval_batchify, get_eval_batch, repackage_hidden, create_exp_dir, save_checkpoint
 
 parser = argparse.ArgumentParser(description='PyTorch PennTreeBank/WikiText2 RNN/LSTM Language Model')
-parser.add_argument('--data', type=str, default='./penn/',
-                    help='location of the data corpus')
+parser.add_argument('--test_data', type=str, default='./penn/',
+                    help='location of the test data corpus')
 parser.add_argument('--model', type=str, default='LSTM',
                     help='type of recurrent net (RNN_TANH, RNN_RELU, LSTM, GRU, SRU)')
 parser.add_argument('--emsize', type=int, default=400,
@@ -118,31 +119,34 @@ if torch.cuda.is_available():
 # Load data
 ###############################################################################
 
-corpus = data.Corpus(args.data)
+vocab_path = os.path.join(args.save, 'vocab.pickle')
+with open(vocab_path, 'rb') as vocab_file:
+    vocab = pickle.load(vocab_file) 
+
+corpus = data.TestCorpus(args.test_data, vocab)
 
 #test_batch_size = 1
 test_batch_size = args.batch_size
-test_data = batchify(corpus.test, test_batch_size, args)
+test_data, test_mask = eval_batchify(corpus.test, test_batch_size, args)
 
 ###############################################################################
 # Evaluating code
 ###############################################################################
 
-def evaluate(data_source, batch_size=10, average_ensemble=True):
+def evaluate(data_source, data_source_mask, batch_size=10, average_ensemble=True):
     # Turn on evaluation mode which disables dropout.
     model.eval()
     total_loss = 0
-    ntokens = len(corpus.dictionary)
+    ntokens = len(corpus.vocab)
     hidden = model.init_hidden(batch_size)
     with torch.no_grad():
         for i in range(0, data_source.size(0) - 1, args.bptt):
-            data, targets = get_batch(data_source, i, args)
-            targets = targets.view(-1)
+            data, targets, mask = get_eval_batch(data_source, data_source_mask, i, args)
+            masked_targets = targets * mask -100 * (1-mask)     # -100 is the masking value for targets
+            masked_targets = masked_targets.view(-1)
 
-            #print(data.shape)
-            #print([h.shape for h in hidden])
             log_prob, hidden = parallel_model(*hidden, input=data, average_ensemble=average_ensemble)
-            loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), targets).data
+            loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), masked_targets, ignore_index=-100).data
 
             total_loss += loss * len(data)
 
@@ -156,9 +160,10 @@ parallel_model = nn.DataParallel(model.cuda(), dim=1)
 #parallel_model = model.cuda()
 
 # Run on test data.
-test_loss = evaluate(test_data, test_batch_size, average_ensemble=not args.no_average_ensemble)
+test_loss = evaluate(test_data, test_mask, test_batch_size, average_ensemble=not args.no_average_ensemble)
 logging('=' * 89)
-logging('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
+logging('| Test set: %s' % args.test_data)
+logging('| Evaluation results | test loss {:5.2f} | test ppl {:8.2f}'.format(
     test_loss, math.exp(test_loss)))
 logging('=' * 89)
 

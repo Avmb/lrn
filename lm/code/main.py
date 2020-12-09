@@ -2,6 +2,7 @@ import argparse
 import os, sys
 import time
 import math
+import pickle
 import numpy as np
 import torch
 import torch.nn as nn
@@ -13,7 +14,7 @@ import gc
 import data
 import model
 
-from utils import batchify, get_batch, repackage_hidden, create_exp_dir, save_checkpoint
+from utils import batchify, get_batch, eval_batchify, get_eval_batch, repackage_hidden, create_exp_dir, save_checkpoint
 
 parser = argparse.ArgumentParser(description='PyTorch PennTreeBank/WikiText2 RNN/LSTM Language Model')
 parser.add_argument('--data', type=str, default='./penn/',
@@ -55,7 +56,7 @@ parser.add_argument('--tied', action='store_false',
 parser.add_argument('--seed', type=int, default=1111,
                     help='random seed')
 parser.add_argument('--nonmono', type=int, default=5,
-                    help='random seed')
+                    help='Non mono')
 parser.add_argument('--cuda', action='store_false',
                     help='use CUDA')
 parser.add_argument('--log-interval', type=int, default=200, metavar='N',
@@ -81,12 +82,20 @@ parser.add_argument('--max_seq_len_delta', type=int, default=40,
 parser.add_argument('--single_gpu', default=False, action='store_true', 
                     help='use single GPU')
 
-# LM robustness
+# Util
+parser.add_argument('--vocab_min_count', type=int, default=5,
+                    help='minimum word count when building the vocabulary')
+parser.add_argument('--patience', type=int, default=10,
+                    help='Early stopping patience, set to negative to disable')
+
+# LM robustness (distillation)
 parser.add_argument('--ndistilstudents', type=int, default=0,
                     help='number state  distillation students per layer')
 parser.add_argument('--distillossw', type=float, default=1.0,
                     help='student distillation loss weight')
-
+parser.add_argument('--unigram_prob_on_zero', action='store_true',
+                    help='configure the model such as a zero state results in unigram probability')
+                    
 args = parser.parse_args()
 
 if args.nhidlast < 0:
@@ -120,27 +129,38 @@ if torch.cuda.is_available():
 # Load data
 ###############################################################################
 
-corpus = data.Corpus(args.data)
+vocab_path = os.path.join(args.save, 'vocab.pickle')
+vocab = None
+if args.continue_train:
+    with open(vocab_path, 'rb') as vocab_file:
+        vocab = pickle.load(vocab_file) 
+
+corpus = data.Corpus(args.data, vocab=vocab, vocab_min_count=args.vocab_min_count)
+vocab = corpus.vocab
+if not args.continue_train:
+    with open(vocab_path, 'wb') as vocab_file:
+        pickle.dump(vocab, vocab_file)
 
 #eval_batch_size = 10
 #test_batch_size = 1
 eval_batch_size=args.batch_size
 test_batch_size=args.batch_size
 train_data = batchify(corpus.train, args.batch_size, args)
-val_data = batchify(corpus.valid, eval_batch_size, args)
-test_data = batchify(corpus.test, test_batch_size, args)
+val_data, val_mask = eval_batchify(corpus.valid, eval_batch_size, args)
+test_data, test_mask = eval_batchify(corpus.test, test_batch_size, args)
 
 ###############################################################################
 # Build the model
 ###############################################################################
 
-ntokens = len(corpus.dictionary)
+ntokens = len(corpus.vocab)
 if args.continue_train:
     model = torch.load(os.path.join(args.save, 'model.pt'))
 else:
+    unigram_frequencies = vocab.get_frequencies()
     model = model.RNNModel(args.model, ntokens, args.emsize, args.nhid, args.nhidlast, args.nlayers, 
                        args.dropout, args.dropouth, args.dropouti, args.dropoute, args.wdrop, 
-                       args.tied, args.dropoutl, args.n_experts, args.ndistilstudents)
+                       args.tied, args.dropoutl, args.n_experts, args.ndistilstudents, args.unigram_prob_on_zero, unigram_frequencies)
 
 if args.cuda:
     if args.single_gpu:
@@ -160,19 +180,20 @@ criterion = nn.CrossEntropyLoss()
 # Training code
 ###############################################################################
 
-def evaluate(data_source, batch_size=10):
+def evaluate(data_source, data_source_mask, batch_size=10):
     # Turn on evaluation mode which disables dropout.
     model.eval()
     total_loss = 0
-    ntokens = len(corpus.dictionary)
+    ntokens = len(corpus.vocab)
     hidden = model.init_hidden(batch_size)
     with torch.no_grad():
         for i in range(0, data_source.size(0) - 1, args.bptt):
-            data, targets = get_batch(data_source, i, args)
-            targets = targets.view(-1)
+            data, targets, mask = get_eval_batch(data_source, data_source_mask, i, args)
+            masked_targets = targets * mask -100 * (1-mask)     # -100 is the masking value for targets
+            masked_targets = masked_targets.view(-1)
 
             log_prob, hidden = parallel_model(*hidden, input=data, average_ensemble=True)
-            loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), targets).data
+            loss = nn.functional.nll_loss(log_prob.view(-1, log_prob.size(2)), masked_targets, ignore_index=-100).data
 
             total_loss += loss * len(data)
 
@@ -186,7 +207,7 @@ def train():
     # Turn on training mode which enables dropout.
     total_loss = 0
     start_time = time.time()
-    ntokens = len(corpus.dictionary)
+    ntokens = len(corpus.vocab)
     hidden = [model.init_hidden(args.small_batch_size) for _ in range(args.batch_size // args.small_batch_size)]
     batch, i = 0, 0
     while i < train_data.size(0) - 1 - 1:
@@ -272,6 +293,7 @@ try:
     else:
         optimizer = torch.optim.SGD(model.parameters(), lr=args.lr, weight_decay=args.wdecay)
 
+    patience = args.patience
     for epoch in range(1, args.epochs+1):
         epoch_start_time = time.time()
         train()
@@ -279,9 +301,10 @@ try:
             tmp = {}
             for prm in model.parameters():
                 tmp[prm] = prm.data.clone()
-                prm.data = optimizer.state[prm]['ax'].clone()
+                if prm.requires_grad:
+                    prm.data = optimizer.state[prm]['ax'].clone()
 
-            val_loss2 = evaluate(val_data, eval_batch_size)
+            val_loss2 = evaluate(val_data, val_mask, eval_batch_size)
             logging('-' * 89)
             logging('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
                     'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
@@ -292,12 +315,18 @@ try:
                 save_checkpoint(model, optimizer, args.save)
                 logging('Saving Averaged!')
                 stored_loss = val_loss2
+                patience = args.patience
+            
+            patience -= 1
+            if patience == 0:
+                logging('Early stopping!')
+                raise KeyboardInterrupt()
 
             for prm in model.parameters():
                 prm.data = tmp[prm].clone()
 
         else:
-            val_loss = evaluate(val_data, eval_batch_size)
+            val_loss = evaluate(val_data, val_mask, eval_batch_size)
             logging('-' * 89)
             logging('| end of epoch {:3d} | time: {:5.2f}s | valid loss {:5.2f} | '
                     'valid ppl {:8.2f}'.format(epoch, (time.time() - epoch_start_time),
@@ -325,7 +354,7 @@ parallel_model = nn.DataParallel(model, dim=1).cuda()
 #parallel_model = model.cuda()
 
 # Run on test data.
-test_loss = evaluate(test_data, test_batch_size)
+test_loss = evaluate(test_data, test_mask, test_batch_size)
 logging('=' * 89)
 logging('| End of training | test loss {:5.2f} | test ppl {:8.2f}'.format(
     test_loss, math.exp(test_loss)))

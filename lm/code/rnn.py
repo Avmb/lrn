@@ -219,14 +219,19 @@ class RNN(nn.Module):
             cell = self.get_cell(layer)
             cell.reset_parameters()
 
-    def _forward_rnn(self, cell, x, h, L, **kwargs):
+    def _forward_rnn(self, cell, x, h, L, state_post_proc=None, **kwargs):
         max_time = x.size(0)
         output = []
+        if self.n_students == 0:
+            cell_kwargs = dict(kwargs)
+            del cell_kwargs['distill_loss_acc']
+        else:
+            cell_kwargs = kwargs
         for time in range(max_time):
             if self.c_on:
-                new_h, new_c = cell(x[time], h, **kwargs)
+                new_h, new_c = cell(x[time], h, **cell_kwargs)
             else:
-                new_h = cell(x[time], h, **kwargs)
+                new_h = cell(x[time], h, **cell_kwargs)
 
             mask = (time < L).float().unsqueeze(1).expand_as(new_h)
             new_h = new_h*mask + h[0]*(1 - mask)
@@ -237,12 +242,14 @@ class RNN(nn.Module):
             else:
                 h = new_h
 
+            if state_post_proc is not None:
+                new_h = state_post_proc(new_h, **kwargs)
             output.append(new_h)
 
         output = torch.stack(output, 0)
         return output, h
 
-    def forward(self, x, h=None, L=None, **kwargs):
+    def forward(self, x, h=None, L=None, state_post_proc=None, **kwargs):
         if self.batch_first:
             x = x.transpose(0, 1)
         max_time, batch_size, _ = x.size()
@@ -266,12 +273,14 @@ class RNN(nn.Module):
             else:
                 h_layer = h[layer, :, :]
             
+            #state_post_proc_cur_layer = state_post_proc[layer] if state_post_proc is not None else None
+            state_post_proc_cur_layer = state_post_proc
             if layer == 0:
                 layer_output, layer_state = self._forward_rnn(
-                    cell, x, h_layer, L, **kwargs)
+                    cell, x, h_layer, L, state_post_proc=state_post_proc_cur_layer, **kwargs)
             else:
                 layer_output, layer_state = self._forward_rnn(
-                    cell, layer_output, h_layer, L, **kwargs)
+                    cell, layer_output, h_layer, L, state_post_proc=state_post_proc_cur_layer, **kwargs)
 
             if layer != self.num_layers - 1:
                 layer_output = self.dropout_layer(layer_output)
@@ -331,4 +340,17 @@ class StudentDistillCell(nn.Module):
                 h = torch.stack(all_h_list).mean(dim=0)
         return h
 
-
+#class StatePostProcCell(nn.Module):
+#    def __init__(self, main_cell, postproc_module=None):
+#        super(StatePostProcCell, self).__init__()
+#        self.main_cell=main_cell
+#        self.postproc_module=postproc_module
+#        
+#    def reset_parameters(self):
+#        self.main_cell.reset_parameters()
+#    
+#    def forward(self, x, h_, postproc_args={}, **kwargs):
+#        h = self.main_cell(x, h_)
+#        if self.postproc_module is not None:
+#            h = self.postproc_module(h, **postproc_args)
+#        return h
