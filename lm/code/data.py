@@ -82,6 +82,22 @@ class Vocab(object):
         ids = torch.LongTensor(ids).to(device=device)
         return ids
 
+    def tokenize_by_sentence(self, path, device='cpu'):
+        """Tokenizes a text file."""
+        # Tokenize file content
+        sent_acc = []
+        with open(path, 'r', encoding='utf-8') as f:
+            for line in f:
+                #if len(line.strip()) == 0:
+                #    continue
+                ids = []
+                words = line.split() + ['<eos>']
+                for word in words:
+                    ids.append(self.word2idx.get(word, 0)) # 0 is the id of the <unk> word
+                ids = torch.LongTensor(ids).to(device=device)
+                sent_acc.append(ids)
+        return sent_acc
+
 
 class Corpus(object):
     def __init__(self, path, vocab=None, vocab_min_count=1):
@@ -100,3 +116,7 @@ class TestCorpus(object):
         self.vocab = vocab
         self.test = self.vocab.tokenize(path)
 
+class SentTestCorpus(object):
+    def __init__(self, path, vocab):
+        self.vocab = vocab
+        self.test_sentences = self.vocab.tokenize_by_sentence(path)
